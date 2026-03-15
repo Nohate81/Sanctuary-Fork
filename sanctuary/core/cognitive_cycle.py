@@ -17,6 +17,7 @@ Aligned with PLAN.md: "The Graduated Awakening"
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, Protocol
 
@@ -34,6 +35,8 @@ from sanctuary.core.schema import (
 )
 from sanctuary.core.stream_of_thought import StreamOfThought
 from sanctuary.motor.motor import Motor
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +122,15 @@ class MotorProtocol(Protocol):
 class IdentityProtocol(Protocol):
     """Interface for the identity system (Phase 5 integration).
 
-    Provides charter summary and values for each cycle, and processes
-    value changes from the LLM's self-model updates.
+    Provides charter summary, values, and self-authored identity for each
+    cycle, and processes value/identity changes from the LLM's self-model updates.
     """
 
     def get_charter_summary(self) -> str: ...
 
     def get_values(self) -> list[str]: ...
+
+    def get_self_authored_identity(self) -> str: ...
 
     def process_value_updates(self, updates) -> None: ...
 
@@ -204,13 +209,16 @@ class NullMemory:
 
 
 class NullIdentity:
-    """Minimal identity — no charter, no values."""
+    """Minimal identity — no charter, no values, no self-authored traits."""
 
     def get_charter_summary(self) -> str:
         return ""
 
     def get_values(self) -> list[str]:
         return []
+
+    def get_self_authored_identity(self) -> str:
+        return ""
 
     def process_value_updates(self, updates) -> None:
         pass
@@ -245,6 +253,8 @@ class CognitiveCycle:
         authority: Optional[AuthorityManager] = None,
         identity: Optional[IdentityProtocol] = None,
         experiential=None,
+        growth=None,
+        environment=None,
         context_config: Optional[BudgetConfig] = None,
         stream_history: int = 10,
         cycle_delay: float = 0.1,
@@ -257,6 +267,8 @@ class CognitiveCycle:
         self.authority = authority or AuthorityManager()
         self.identity = identity or NullIdentity()
         self.experiential = experiential  # Optional ExperientialManager
+        self.growth = growth  # Optional GrowthProcessor
+        self.environment = environment  # Optional EnvironmentIntegration
         self.context_mgr = ContextManager(context_config)
         self.stream = StreamOfThought(max_history=stream_history)
 
@@ -346,6 +358,14 @@ class CognitiveCycle:
         # 8. Update prediction tracking
         self.sensorium.update_predictions(cognitive_output.predictions)
 
+        # 6b. Process environment actions (before bookkeeping, so percepts
+        #     land in the queue for the next cycle)
+        if self.environment is not None:
+            try:
+                self.environment.process_output(integrated)
+            except Exception as e:
+                logger.error("Environment processing error (non-fatal): %s", e)
+
         # Bookkeeping
         self.cycle_count += 1
         self._last_output = cognitive_output
@@ -353,6 +373,13 @@ class CognitiveCycle:
         # Notify handlers
         for handler in self._output_handlers:
             await handler(cognitive_output)
+
+        # 9. Growth processing (after all other processing, errors never crash cycle)
+        if self.growth is not None:
+            try:
+                await self.growth.process_cycle(cognitive_output, self.cycle_count)
+            except Exception as e:
+                logger.error("Growth processing error (non-fatal): %s", e)
 
     async def _assemble_input(self) -> CognitiveInput:
         """Gather everything the LLM needs for this moment of thought."""
@@ -409,6 +436,13 @@ class CognitiveCycle:
         if identity_values:
             self_model.values = identity_values
 
+        # Inject environment location context into world model
+        world_model = self.stream.get_world_model()
+        if self.environment is not None:
+            location_ctx = self.environment.get_location_context()
+            if location_ctx:
+                world_model.environment.update(location_ctx)
+
         return CognitiveInput(
             previous_thought=self.stream.get_previous(),
             new_percepts=percepts,
@@ -420,10 +454,11 @@ class CognitiveCycle:
             ),
             temporal_context=temporal,
             self_model=self_model,
-            world_model=self.stream.get_world_model(),
+            world_model=world_model,
             scaffold_signals=self.scaffold.get_signals(),
             experiential_state=experiential_signals,
             charter_summary=self.identity.get_charter_summary(),
+            self_authored_identity=self.identity.get_self_authored_identity(),
         )
 
     async def _execute(self, output: CognitiveOutput):
